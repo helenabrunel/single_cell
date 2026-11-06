@@ -1,0 +1,15 @@
+# Whitelist: only these paths are tracked, so raw data, h5ad objects,
+# figures and result tables never get committed.
+/*
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/scripts/
+!/docs/
+!/signatures/
+!/landscent_src/
+/landscent_src/*
+!/landscent_src/*.R
+
+__pycache__/
+.ipynb_checkpoints/

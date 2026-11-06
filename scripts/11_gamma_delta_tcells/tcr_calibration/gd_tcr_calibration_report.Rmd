@@ -1,0 +1,823 @@
+---
+title: "γδ T cells in breast cancer — Azizi et al. 2018 (GSE114727)"
+subtitle: "Abundance, Vδ subsets and functional states of γδ T cells"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dev = "png", dpi = 110)
+suppressPackageStartupMessages({
+  library(ggplot2); library(dplyr); library(tidyr); library(patchwork)
+  library(scales); library(knitr)
+})
+ROOT <- ".."
+DAT  <- file.path(ROOT, "report", "data")
+rd <- function(f) read.csv(gzfile(file.path(DAT, f)), check.names = FALSE,
+                           stringsAsFactors = FALSE)
+
+theme_umap <- theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 11),
+        legend.key.size = unit(0.35, "cm"), legend.text = element_text(size = 8),
+        legend.title = element_text(size = 9))
+theme_set(theme_bw(base_size = 11))
+
+# UMAP coloured by a categorical variable
+umap_cat <- function(d, col, title = col, pal = NULL, size = 0.3,
+                     highlight = NULL, size_hi = 1.1) {
+  d <- d[order(d[[col]] %in% highlight), ]          # highlighted cells on top
+  d$.sz <- ifelse(d[[col]] %in% highlight, size_hi, size)
+  p <- ggplot(d, aes(UMAP1, UMAP2, colour = .data[[col]], size = .sz)) +
+    geom_point(stroke = 0, shape = 16) + scale_size_identity() +
+    ggtitle(title) + theme_umap +
+    guides(colour = guide_legend(override.aes = list(size = 3), title = NULL))
+  if (!is.null(pal)) p <- p + scale_colour_manual(values = pal, na.value = "grey85")
+  p
+}
+# UMAP coloured by expression (positive cells plotted on top)
+umap_gene <- function(d, g, title = g, size = 0.3, size_hi = 1.1, limits = NULL) {
+  d <- d[order(d[[g]]), ]
+  d$.sz <- ifelse(d[[g]] > 0, size_hi, size)
+  ggplot(d, aes(UMAP1, UMAP2, colour = .data[[g]], size = .sz)) +
+    geom_point(stroke = 0, shape = 16) + scale_size_identity() +
+    ggtitle(title) + theme_umap +
+    scale_colour_gradientn(colours = c("grey88", "#fdae61", "#d73027", "#67001f"),
+                           limits = limits, name = NULL)
+}
+auc <- function(score, label) {             # Mann–Whitney AUC
+  score[is.na(score)] <- 0
+  r <- rank(score); n1 <- sum(label); n0 <- sum(!label)
+  (sum(r[label]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+lab_sig <- function(x) gsub("_", " ", sub("^sig_", "", x))
+# heatmap of mean signature score per group: z-score of the group means within each signature (column);
+# the number in each tile is that same z-score
+sig_heatmap <- function(d, groups, labeller = identity) {
+  d %>% filter(group %in% groups) %>%
+    pivot_longer(all_of(SIGS), names_to = "sig") %>%
+    group_by(group, sig) %>% summarise(m = mean(value), n = n(), .groups = "drop") %>%
+    group_by(sig) %>% mutate(z = (m - mean(m)) / sd(m)) %>% ungroup() %>%
+    mutate(label = paste0(labeller(group), " (n=", n, ")"),
+           label = factor(label, levels = rev(unique(label[order(match(group, groups))]))),
+           sig = lab_sig(sig)) %>%
+    ggplot(aes(sig, label, fill = z)) + geom_tile(colour = "white") +
+    geom_text(aes(label = sprintf("%.2f", z), colour = abs(z) > 1.2), size = 3, show.legend = FALSE) +
+    scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "black")) +
+    scale_fill_gradient2(low = "#2166ac", mid = "grey97", high = "#b2182b", limits = c(-2, 2),
+                         oob = squish, name = "z-score") +
+    labs(x = NULL, y = NULL,
+         caption = "Number and colour = z-score of the group mean within each signature (column).") +
+    theme_minimal(base_size = 11) + theme(axis.text.x = element_text(angle = 30, hjust = 1),
+                                          panel.grid = element_blank())
+}
+
+PAL_CALL <- c(gdT_high = "#b2182b", gdT_medium = "#ef8a62", gdT_low = "#fddbc7",
+              `TRDC+_abPair` = "#4393c3", `TRDC+_CD3neg` = "#92c5de",
+              non_gd = "grey85")
+PAL_SUB  <- c(Vd1 = "#1b9e77", Vd2 = "#d95f02", Vg9Vd2 = "#7570b3",
+              Vd3 = "#e7298a", Vd_undetermined = "grey60")
+PAL_ST   <- c(Tgd = "#b2182b", `other T` = "grey85", `None T` = "grey60", `NA` = "grey40")
+PAL_LIN  <- c(T = "#377eb8", NK = "#984ea3", B = "#4daf4a", Myeloid = "#ff7f00",
+              Mast = "#a65628", Epi_Stroma = "#999999", Plasma = "#f781bf",
+              pDC = "#ffff33")
+PAL_SUBTYPE <- c(`HR+` = "#4DAF4A", TNBC = "#E41A1C", `HER2+` = "#984EA3")
+PAL_GRP  <- c(`γδ Vδ1` = "#1b9e77", `γδ Vδ2` = "#7570b3", `γδ Vδ3` = "#e7298a",
+              `αβ CD8` = "#4393c3", `αβ CD4` = "#92c5de", `αβ Treg` = "#878787")
+```
+
+```{r load}
+clin   <- read.csv(file.path(ROOT, "data/metadata/clinical_patients.csv"),
+                   stringsAsFactors = FALSE)
+all10  <- rd("10x_all.csv.gz");    allid  <- rd("indrop_all.csv.gz")
+tnk10  <- rd("10x_TNK.csv.gz");    tnkid  <- rd("indrop_TNK.csv.gz")
+gd10   <- rd("10x_gdT.csv.gz");    gdid   <- rd("indrop_gdT.csv.gz")
+cnt10  <- rd("10x_TNK_counts.csv.gz")
+sig10  <- rd("10x_signatures.csv.gz"); sigid <- rd("indrop_signatures.csv.gz")
+SIGS   <- grep("^sig_", names(sig10), value = TRUE)
+
+add_stcat <- function(d) {
+  d$stcat_Tgd <- ifelse(d$stcat_label %in% "Tgd" | d$stcat_l0_cell %in% "Tgd", "Tgd",
+                 ifelse(d$stcat_label %in% "None T", "None T",
+                 ifelse(is.na(d$stcat_label) | d$stcat_label == "NA", "NA", "other T")))
+  d$stcat_P_Tgd[is.na(d$stcat_P_Tgd)] <- 0
+  d
+}
+tnk10 <- add_stcat(tnk10); tnkid <- add_stcat(tnkid)
+gd10  <- add_stcat(gd10);  gdid  <- add_stcat(gdid)
+tnk10$ab_pair <- tnk10$has_TRA_productive == "True" & tnk10$has_TRB_productive == "True"
+for (d in c("tnk10", "tnkid", "gd10", "gdid", "sig10", "sigid")) {
+  x <- get(d); x$is_gdT <- x$is_gdT %in% c(TRUE, "True"); assign(d, x)
+}
+
+qc_log <- readLines(file.path(ROOT, "logs/01_prepare.log"))
+qc <- regmatches(qc_log, regexpr("^\\s+(10x|indrop): \\d+ → \\d+ cells, \\d+ genes", qc_log))
+```
+
+# Summary
+
+* **Dataset.** GSE114727 contains two experiments, analysed separately: **10x 5' + TCR** (3 patients,
+  tumour only, sorted CD3⁺ T cells) and **inDrop** (8 patients, tumour / normal breast / blood / lymph
+  node, CD45⁺ immune cells). Clinical data (subtype, grade…) exist only for the inDrop patients.
+* **Abundance.** γδ T cells are a small population: **`r sum(tnk10$is_gdT)` cells in 10x**
+  (`r percent(mean(tnk10$is_gdT), 0.1)` of T cells, 1.8–3.1 % per patient) and
+  **`r sum(tnkid$is_gdT)` in inDrop** (`r percent(mean(tnkid$is_gdT), 0.1)` of T/NK cells; likely an
+  underestimate, see Appendix A).
+* **Vδ subsets** (10x only): tumour γδ cells are mostly **Vδ1** and **Vγ9Vδ2**, in different
+  proportions per patient.
+* **Functional state.** γδ cells are cytotoxic and IFN-γ-producing (comparable to αβ CD8 cells);
+  **no IL-17 programme** is detected. **Vδ1** cells show more exhaustion/dysfunction markers (PDCD1,
+  TIGIT, TOX); **Vδ2** cells an innate-like (KLRB1/CD161, IL18RAP, IL12RB2, NKG2A) and memory programme.
+  The direction is the same in all 3 patients, but the effect is driven mainly by one patient (BC09).
+* **Tissue and clinic** (inDrop): descriptive only (1–5 patients per group).
+* **Method note.** γδ cells were identified by TRDC expression plus the *absence* of an αβ TCR, which is
+  why αβ T cells appear in the identification step (Section 2.2, Appendix A). The automatic annotator
+  STCAT does not recover γδ cells in this dataset.
+
+# Background
+
+## γδ T cells and Vδ subsets
+
+* **γδ T cells** are T cells whose receptor (TCR) is made of a **γ** and a **δ** chain instead of the
+  α and β chains used by conventional (αβ) T cells. They are a minority of T cells (typically a few %).
+* Every δ chain has the same **constant** region (gene *TRDC*), so TRDC marks "this is a γδ cell"
+  without saying which kind.
+* The δ chain also has a **variable** region encoded by one of a few *TRDV* genes. γδ cells are
+  classified by the one they use: **Vδ1** (*TRDV1*), **Vδ2** (*TRDV2*), **Vδ3** (*TRDV3*, rare). In
+  adults, Vδ2 almost always pairs with the Vγ9 chain (*TRGV9*) → **Vγ9Vδ2** cells.
+* Vδ1 and Vδ2 behave almost as different populations:
+
+| | **Vδ1** | **Vγ9Vδ2** |
+|---|---|---|
+| Where they predominate | Tissues/epithelia and solid tumours | Peripheral blood (most circulating γδ in adults) |
+| What they recognise | Diverse, poorly defined stress/transformation ligands | Phosphoantigens (mevalonate pathway) via butyrophilins BTN3A1/BTN2A1 |
+| Typical phenotype | Tissue-resident; in tumours, exhaustion markers | Innate-like (CD161, IL-12/IL-18 receptors, NKG2A) |
+| Therapeutic interest | Expanded Vδ1 cell therapies | Activated pharmacologically (e.g. zoledronate), cell therapies |
+
+## How γδ cells were identified, and why αβ T cells appear
+
+There is no perfect single marker for γδ cells in scRNA-seq:
+
+* **TRDC** can appear in non-γδ cells: γδ–αβ **doublets** (two cells in one droplet), ambient RNA, and
+  NK cells (germline TRDC transcripts).
+* **TRDV1 and TRGC1/TRGC2** are also expressed by many αβ T cells (Appendix A.3), so they cannot be
+  used alone.
+
+The most reliable evidence that a TRDC⁺ cell is a genuine γδ T cell is that it does **not** carry a
+productive αβ TCR. In 10x the TCR was sequenced (α/β chains only), so this can be checked directly.
+In the identification step, **αβ T cells are only used to *exclude* cells** — a quality-control step
+for the γδ call. The full calibration and validation (including the comparison with STCAT) are in
+**Appendix A**. αβ T cells appear once more, deliberately, as a **reference** for the γδ functional
+signatures (Section 6.3).
+
+| | CD3 | TRDC / TRDV | Productive αβ TCR pair |
+|---|---|---|---|
+| **γδ T** | yes | **yes** | **no** |
+| **αβ T** | yes | no (but see TRDV1/TRGC) | yes |
+| **NK** | **no** | germline TRDC possible | no |
+
+Final calls: in **10x**, TRDC⁺ (or TRDV1/2⁺) cells without a productive αβ pair; in **inDrop** (no TCR
+data), TRDC⁺ cells that also express CD3. Vδ subset = the TRDV gene with most UMIs; **Vγ9Vδ2** if TRDV2
+and TRGV9 are co-expressed.
+
+# Data
+
+```{r patients}
+clin %>%
+  transmute(Patient = patient, Age = age, Platform = platform,
+            Tissues = tissues, Subtype = subtype,
+            ER = ifelse(is.na(ER), "", percent(ER)), PR = ifelse(is.na(PR), "", percent(PR)),
+            HER2, Grade = grade, `Size (cm)` = size_cm, Metastases = metastases) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.x), "", as.character(.x)))) %>%
+  kable(caption = "Patients. Clinical data for BC01–BC08 transcribed from Fig. S1A of Azizi et al. 2018. Subtype: HER2+ if HER2 +; HR+ if ER or PR ≥ 10 %; otherwise TNBC (BC05 is ER-low, 5 %). BC09–BC11 (10x/TCR) only have age.")
+```
+
+Our own clustering (Harmony by sample + Leiden); lineage labels are assigned automatically from marker
+scores (the GEO data contain no annotations). γδ cells were searched in the T + NK-like compartment
+(`r format(nrow(tnkid), big.mark = ",")` inDrop cells; all `r format(nrow(tnk10), big.mark = ",")`
+10x cells). QC details in Appendix B.
+
+```{r lineage, fig.width=11, fig.height=4.5}
+p1 <- umap_cat(allid, "lineage", "inDrop — all cells (CD45⁺)", PAL_LIN, size = 0.25)
+p2 <- umap_cat(allid, "tissue", "inDrop — tissue", size = 0.25)
+p3 <- umap_cat(tnk10, "gd_call", "10x — T cells: γδ call", PAL_CALL,
+               highlight = c("gdT_high", "gdT_medium"))
+p1 + p2 + p3
+```
+
+# γδ T-cell abundance
+
+```{r abundance_10x}
+tnk10 %>% group_by(Patient = patient) %>%
+  summarise(`T cells` = n(), `γδ cells` = sum(is_gdT), `% γδ` = round(100 * mean(is_gdT), 2)) %>%
+  kable(caption = "10x (tumour): γδ cells per patient.")
+```
+
+```{r indrop_frac, fig.width=10, fig.height=4}
+fr <- tnkid %>% group_by(patient, tissue) %>%
+  summarise(n = n(), gd = sum(is_gdT), .groups = "drop") %>%
+  mutate(pct = 100 * gd / n) %>%
+  left_join(clin %>% select(patient, subtype, grade), by = "patient")
+ggplot(fr, aes(patient, pct, fill = subtype)) + geom_col() +
+  geom_text(aes(label = gd), vjust = -0.3, size = 3) +
+  facet_grid(~tissue, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = PAL_SUBTYPE) +
+  labs(x = NULL, y = "% γδ in T/NK", fill = "Subtype",
+       title = "inDrop: γδ cells by patient, tissue and clinical subtype",
+       caption = "Number above bar = γδ cells") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Same data **by patient**, with the tissues of each patient side by side:
+
+```{r indrop_frac_patient, fig.width=11, fig.height=5}
+fr %>% mutate(label = paste0(patient, " (", ifelse(is.na(subtype), "NA", subtype), ")"),
+              tissue = factor(tissue, levels = c("TUMOR", "NORMAL", "BLOOD", "LYMPHNODE"))) %>%
+  ggplot(aes(tissue, pct, fill = tissue)) + geom_col() +
+  geom_text(aes(label = paste0(gd, "/", n)), vjust = -0.3, size = 2.8) +
+  facet_wrap(~label, nrow = 2, scales = "free_x") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c(TUMOR = "#b2182b", NORMAL = "#4daf4a", BLOOD = "#984ea3",
+                               LYMPHNODE = "#ff7f00"), guide = "none") +
+  labs(x = NULL, y = "% γδ in T/NK", title = "inDrop: γδ cells by patient and tissue",
+       caption = "Label = γδ cells / T-NK cells. Same y scale in all panels.") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+With 1–5 patients per subtype and some samples with < 10 γδ cells (e.g. BC01 and BC03 tumour), these
+proportions are **descriptive**; they do not support statistical testing by subtype. inDrop values are
+probably underestimates (TRDC/CD3 dropout, Appendix A.2).
+
+# Vδ subsets (10x)
+
+```{r gd_umap_10x, fig.width=12, fig.height=7}
+(umap_cat(gd10, "gd_subset", "Vδ subset", PAL_SUB, size = 1.2, size_hi = 1.2) |
+   umap_cat(gd10, "patient", "Patient", size = 1.2, size_hi = 1.2) |
+   umap_gene(gd10, "TRDC", size = 1.2, size_hi = 1.2)) /
+(umap_gene(gd10, "TRDV1", size = 1.2, size_hi = 1.2) | umap_gene(gd10, "TRDV2", size = 1.2, size_hi = 1.2) |
+   umap_gene(gd10, "TRGV9", size = 1.2, size_hi = 1.2))
+```
+
+```{r gd_counts_10x, fig.width=7, fig.height=3}
+gd10 %>% count(patient, gd_subset) %>% group_by(patient) %>% mutate(f = n / sum(n)) %>%
+  ggplot(aes(f, patient, fill = gd_subset)) + geom_col() +
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5), size = 3, colour = "white") +
+  scale_fill_manual(values = PAL_SUB) + scale_x_continuous(labels = percent) +
+  labs(x = "% of γδ cells", y = NULL, fill = "Vδ subset", caption = "Numbers = cells")
+```
+
+Vδ1 and Vγ9Vδ2 dominate in all three patients, with different balance: Vγ9Vδ2 > Vδ1 in BC09, Vδ1 > Vδ2
+in BC10 and BC11. In inDrop (3', shallow) TRDV genes are almost never detected, so subsets cannot be
+assigned there.
+
+# Functional states of γδ cells
+
+## Signatures and detection
+
+Signatures were scored with `scanpy.tl.score_genes` (background: all T/NK cells). Gene detection in γδ
+cells was checked first:
+
+```{r sig_detection}
+det <- read.csv(file.path(DAT, "signature_gene_detection.csv"))
+det %>% mutate(platform = ifelse(platform == "indrop", "inDrop", platform)) %>%
+  group_by(signature, platform) %>%
+  summarise(genes = paste(paste0(gene, " (", ifelse(is.na(pct_detected_in_gd), "0%, gene filtered",
+                                         paste0(round(pct_detected_in_gd), "%")), ")"), collapse = ", "),
+            scored = first(scored), .groups = "drop") %>%
+  pivot_wider(names_from = platform, values_from = genes) %>%
+  mutate(Scored = ifelse(scored, "yes", "**no**")) %>% select(-scored) %>%
+  rename(Signature = signature) %>%
+  kable(caption = "Genes of each signature and % of γδ cells in which they are detected (> 0 UMI).")
+```
+
+* **IL-17 (γδT17)**: IL17A/IL17F are detected in **no** γδ cell on either platform; RORC, IL23R and CCR6
+  are very rare → there are no detectable IL-17-producing γδ cells; not scored.
+* **Proliferation**: MKI67/TOP2A in ~1 % of γδ cells → not scored (they barely proliferate).
+* In **inDrop**, *Exhaustion* and *Tissue residency* rely on genes detected in < 10 % of cells → unreliable there.
+
+## Signature profile of γδ subsets (10x)
+
+```{r sig_gd, fig.width=8.5, fig.height=2.6}
+sig_heatmap(sig10, c("γδ Vδ1", "γδ Vδ2", "γδ Vδ3"))
+```
+
+Among γδ cells, **Vδ2** has the highest NK-receptor, IFN-γ and naive/memory scores and the lowest
+exhaustion; **Vδ1** and the small **Vδ3** group have higher exhaustion and tissue-residency scores.
+Per-patient consistency is checked in Section 6.4.
+
+## Context: γδ cells vs αβ CD8, CD4 and Treg cells (10x)
+
+To place the γδ scores in context, the same signatures were computed for the main αβ T-cell populations
+of the same tumours. αβ groups are taken from STCAT labels, which are reasonable for αβ cells (STCAT
+only fails on γδ cells, Appendix A.3); cells flagged as `TRDC+_abPair` are excluded.
+
+```{r sig_context_heat, fig.width=8.5, fig.height=3.6}
+grp_all <- c("γδ Vδ1", "γδ Vδ2", "γδ Vδ3", "αβ CD8", "αβ CD4", "αβ Treg")
+sig_heatmap(sig10, grp_all)
+```
+
+Each point below is **one patient** (mean score of that group in that patient, ≥ 10 cells), so the
+comparison is not driven by the very different numbers of cells (hundreds of γδ vs thousands of αβ):
+
+```{r sig_context_patient, fig.width=12, fig.height=4}
+sig10 %>% filter(group %in% grp_all) %>%
+  pivot_longer(all_of(SIGS), names_to = "sig") %>%
+  group_by(patient, group, sig) %>% summarise(m = mean(value), n = n(), .groups = "drop") %>%
+  filter(n >= 10) %>%
+  mutate(group = factor(group, levels = grp_all), sig = lab_sig(sig)) %>%
+  ggplot(aes(group, m, colour = group)) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.6, colour = "grey40", linewidth = 0.3) +
+  geom_point(aes(shape = patient), size = 2.4, position = position_jitter(width = 0.12, seed = 1)) +
+  facet_wrap(~sig, nrow = 1) +
+  scale_colour_manual(values = PAL_GRP, guide = "none") +
+  labs(x = NULL, y = "mean score per patient", shape = "Patient",
+       caption = "Bar = mean of the 3 patients.") +
+  theme(axis.text.x = element_text(angle = 50, hjust = 1))
+```
+
+```{r sig_context_tab}
+ctx <- sig10 %>% filter(group %in% grp_all) %>%
+  pivot_longer(all_of(SIGS), names_to = "sig") %>%
+  group_by(patient, group, sig) %>% summarise(m = mean(value), n = n(), .groups = "drop") %>%
+  filter(n >= 10)
+gd_vs <- function(gd, ab) {
+  ctx %>% filter(group %in% c(gd, ab)) %>%
+    select(patient, group, sig, m) %>% pivot_wider(names_from = group, values_from = m) %>%
+    filter(!is.na(.data[[gd]]), !is.na(.data[[ab]])) %>%
+    mutate(d = .data[[gd]] - .data[[ab]]) %>% group_by(sig) %>%
+    summarise(txt = sprintf("%+.2f (%d/%d)", mean(d), sum(d > 0), n()), .groups = "drop") %>%
+    rename(!!paste(gd, "−", ab) := txt)
+}
+Reduce(function(a, b) left_join(a, b, by = "sig"),
+       list(gd_vs("γδ Vδ1", "αβ CD8"), gd_vs("γδ Vδ2", "αβ CD8"),
+            gd_vs("γδ Vδ1", "αβ CD4"), gd_vs("γδ Vδ2", "αβ CD4"),
+            gd_vs("γδ Vδ1", "αβ Treg"), gd_vs("γδ Vδ2", "αβ Treg"))) %>%
+  mutate(sig = lab_sig(sig)) %>% rename(Signature = sig) %>%
+  kable(caption = "Mean per-patient difference γδ − αβ (in brackets: patients where γδ > αβ).")
+```
+
+* **Cytotoxicity and IFN-γ**: Vδ1 cells are **comparable to αβ CD8** cells; Vδ2 cells slightly higher
+  (cytotoxicity higher in 3/3 patients, IFN-γ in 2/3). Both are far above **CD4** and **Treg** cells
+  (3/3) — tumour γδ cells are an effector, CD8-like population.
+* **NK receptors**: the most γδ-specific feature — higher than every αβ group in 3/3 patients,
+  especially in **Vδ2** (NKG2A/KLRC1, TYROBP); αβ cells have essentially none.
+* **Exhaustion**: γδ cells are **not more exhausted than αβ CD8** cells (Vδ1 ≈ CD8, Vδ2 lower in 3/3),
+  and all are well below **Tregs** (whose score is driven by CTLA4, TIGIT, LAYN — a regulatory rather
+  than an exhausted programme).
+* **Tissue residency**: Vδ1 and Vδ2 show no consistent difference from CD8 cells; all three are above
+  CD4 and Treg cells (3/3).
+* **Naive/memory**: higher in **CD4** than in Vδ1 cells in 3/3 patients; Vδ2 vs CD4 is mixed (Vδ2
+  carries IL7R).
+
+Read the table row by row: the sign tells the direction, the bracket how many of the 3 patients agree.
+
+## Vδ1 vs Vδ2, patient by patient
+
+With only 3 patients, cell-level p-values are inflated (cells from the same patient are not
+independent). What matters is whether the **Vδ1 − Vδ2 difference goes in the same direction in each
+patient**:
+
+```{r sig_vd_patient, fig.width=10, fig.height=3.6}
+pp <- sig10 %>% mutate(fam = case_when(gd_subset == "Vd1" ~ "Vδ1",
+                                       gd_subset %in% c("Vd2", "Vg9Vd2") ~ "Vδ2")) %>%
+  filter(!is.na(fam)) %>% pivot_longer(all_of(SIGS), names_to = "sig") %>%
+  group_by(patient, fam, sig) %>% summarise(m = mean(value), n = n(), .groups = "drop") %>%
+  mutate(sig = lab_sig(sig))
+ggplot(pp, aes(fam, m, group = patient, colour = patient)) +
+  geom_line() + geom_point(aes(size = n)) + facet_wrap(~sig, nrow = 1) +
+  scale_size(range = c(1.5, 4), name = "cells") +
+  labs(x = NULL, y = "mean score", colour = "Patient")
+```
+
+```{r sig_vd_table}
+read.csv(file.path(ROOT, "figures/06_gd_signatures/Vd1_vs_Vd2_signatures_10x.csv")) %>%
+  transmute(Signature = gsub("_", " ", signature),
+            `Δ overall (Vδ1−Vδ2)` = round(diff_Vd1_minus_Vd2, 2),
+            `Δ BC09` = round(diff_BC09, 2), `Δ BC10` = round(diff_BC10, 2), `Δ BC11` = round(diff_BC11, 2),
+            `Same direction` = patients_same_direction) %>%
+  kable(caption = "Difference in mean score Vδ1 − Vδ2, overall and per patient (≥ 10 cells per group).")
+```
+
+* **Consistent in 3/3 patients**: more **exhaustion** in Vδ1; more **memory** and **NK receptors** in
+  Vδ2. Cytotoxicity is overall similar (slightly higher in Vδ2 in all 3 patients, mostly in BC10, which
+  has only 21 Vδ2 cells).
+* The effect size comes mainly from **BC09** (the patient with most γδ cells); in BC10 and BC11 the
+  differences are small. Residency and IFN-γ are not consistent.
+
+**Differentially expressed genes Vδ1 vs Vδ2** (Wilcoxon, TCR genes excluded; FDR < 0.05, expressed in > 20 % of the group):
+
+```{r de_genes, results="asis"}
+log_lines <- readLines(file.path(ROOT, "logs/06_gd_signatures.log"))
+cat(paste0("* ", sub("^DE up in ", "**Higher in ", sub(":", ":**", grep("^DE up in", log_lines, value = TRUE)))), sep = "\n")
+```
+
+```{r de_dot, out.width="100%"}
+knitr::include_graphics(file.path(ROOT, "figures/06_gd_signatures/dotplot_DE_Vd1_vs_Vd2_10x.png"))
+```
+
+This matches the literature: **Vγ9Vδ2** with an innate-like programme (KLRB1/CD161, IL-18 and IL-12
+receptors, DPP4/CD26, RORA, NKG2A), and tumour **Vδ1** with dysfunction markers (TIGIT, PDCD1, TOX) and
+IKZF2 (Helios).
+
+## γδ subclusters (10x)
+
+```{r gd_sub, fig.width=12, fig.height=4.2}
+sub <- gd10 %>% select(cell, UMAP1, UMAP2, gd_leiden, patient, Vd_family) %>%
+  inner_join(sig10 %>% select(cell, all_of(SIGS)), by = "cell") %>%
+  mutate(gd_leiden = factor(gd_leiden))
+p1 <- umap_cat(sub, "gd_leiden", "γδ subcluster", size = 1.2, size_hi = 1.2)
+p2 <- sub %>% count(gd_leiden, patient) %>% group_by(gd_leiden) %>% mutate(f = n / sum(n)) %>%
+  ggplot(aes(f, gd_leiden, fill = patient)) + geom_col() + scale_x_continuous(labels = percent) +
+  labs(x = "% cells", y = "Subcluster", fill = "Patient", title = "Composition by patient")
+p3 <- sub %>% pivot_longer(all_of(SIGS), names_to = "sig") %>%
+  group_by(gd_leiden, sig) %>% summarise(m = mean(value), .groups = "drop") %>%
+  group_by(sig) %>% mutate(z = (m - mean(m)) / sd(m)) %>% ungroup() %>%
+  ggplot(aes(lab_sig(sig), gd_leiden, fill = z)) + geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.1f", z), colour = abs(z) > 1.2), size = 2.6, show.legend = FALSE) +
+  scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "black")) +
+  scale_fill_gradient2(low = "#2166ac", mid = "grey97", high = "#b2182b", limits = c(-2, 2),
+                       oob = squish, name = "z-score") +
+  labs(x = NULL, y = NULL, title = "Signatures (z-score per signature)") + theme_minimal() +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1), panel.grid = element_blank())
+p1 + p2 + p3 + plot_layout(widths = c(1.1, 1, 1))
+```
+
+```{r gd_sub_tab}
+sub %>% count(gd_leiden, Vd_family) %>%
+  pivot_wider(names_from = Vd_family, values_from = n, values_fill = 0) %>%
+  kable(caption = "γδ subclusters: composition by Vδ subset.")
+```
+
+Subclusters are **strongly patient-driven** (5 is almost only BC11; 1 almost only BC09 Vδ2). The only
+state shared by all three patients is **subcluster 0** (mostly Vδ1): high exhaustion, residency, IFN-γ
+and cytotoxicity and low memory — a **tumour-resident effector Vδ1 profile with dysfunction features**.
+The others should not be interpreted as biological states without stronger integration or more patients.
+
+## Tumour vs blood, normal breast and lymph node (inDrop)
+
+```{r indrop_umap, fig.width=12, fig.height=4.5}
+(umap_cat(gdid, "tissue", "γδ inDrop — tissue", size = 1.2, size_hi = 1.2) |
+   umap_cat(gdid, "patient", "Patient", size = 1.2, size_hi = 1.2) |
+   umap_gene(gdid, "TRDC", size = 1.2, size_hi = 1.2))
+```
+
+Mean γδ score per patient and tissue (≥ 10 γδ cells). Lines connect tissues of the same patient.
+
+```{r sig_indrop, fig.width=11, fig.height=3.8}
+SIGS_ID <- grep("^sig_", names(sigid), value = TRUE)
+pid <- sigid %>% filter(is_gdT) %>%
+  pivot_longer(all_of(SIGS_ID), names_to = "sig") %>%
+  group_by(patient, tissue, sig) %>% summarise(m = mean(value), n = n(), .groups = "drop") %>%
+  filter(n >= 10) %>%
+  mutate(sig = lab_sig(sig),
+         sig = ifelse(sig %in% c("Exhaustion", "Tissue residency"), paste0(sig, " *"), sig),
+         tissue = factor(tissue, levels = c("BLOOD", "LYMPHNODE", "NORMAL", "TUMOR")))
+ggplot(pid, aes(tissue, m, group = patient, colour = patient)) +
+  geom_line(alpha = 0.6) + geom_point(aes(size = n)) +
+  facet_wrap(~sig, nrow = 1) + scale_size(range = c(1.5, 4), name = "γδ") +
+  labs(x = NULL, y = "mean γδ score", colour = "Patient",
+       caption = "* unreliable in inDrop (genes detected in < 10 % of cells)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+* **Within-patient** comparisons are few: BC04 (blood vs tumour) and BC02 (lymph node, normal, tumour).
+  In **BC04**, tumour γδ cells show more cytotoxicity, IFN-γ and residency than blood γδ cells. In
+  **BC02**, the lymph node has the most naive/memory profile (24 cells) and the tumour less cytotoxicity
+  than normal breast.
+* With these numbers there is no generalisable tumour-specific pattern; treat as hypotheses.
+
+## Tumour vs other tissues, same patient (inDrop)
+
+Same heatmap as in 6.3, for the inDrop patients that have **tumour plus at least one other tissue**:
+
+| Patient | Tissues |
+|---|---|
+| BC01 | blood, normal breast, tumour |
+| BC02 | lymph node, normal breast, tumour |
+| BC03 | normal breast, tumour |
+| BC04 | blood, tumour |
+
+BC08 is left out because its normal sample has only 24 T/NK cells.
+
+* αβ groups come from the STCAT labels, as in 10x.
+* γδ cells are not split by Vδ, because inDrop does not detect V genes.
+* The z-score is computed **within each patient**, across that patient's group × tissue rows. Colours
+  can be compared between the tissues of one patient, but not between patients.
+* Rows with fewer than 10 cells are left blank.
+
+```{r sig_nt_heat, fig.width=12, fig.height=10}
+GRP_NT <- c("γδ", "αβ CD8", "αβ CD4", "αβ Treg")
+TIS_NT <- c(BLOOD = "Blood", LYMPHNODE = "Lymph node", NORMAL = "Normal", TUMOR = "Tumour")
+tnkid_lab <- tnkid %>% select(cell, stcat_label, gd_call)
+nt <- sigid %>% filter(patient %in% c("BC01", "BC02", "BC03", "BC04")) %>%
+  inner_join(tnkid_lab, by = "cell") %>%
+  mutate(grp = case_when(is_gdT ~ "γδ",
+                         gd_call != "non_gd" ~ NA_character_,
+                         grepl("Treg", stcat_label) ~ "αβ Treg",
+                         startsWith(stcat_label, "CD8") ~ "αβ CD8",
+                         startsWith(stcat_label, "CD4") ~ "αβ CD4")) %>%
+  filter(!is.na(grp))
+SIGS_ID <- grep("^sig_", names(sigid), value = TRUE)
+nt_m <- nt %>% pivot_longer(all_of(SIGS_ID), names_to = "sig") %>%
+  group_by(patient, grp, tissue, sig) %>% summarise(m = mean(value), n = n(), .groups = "drop") %>%
+  group_by(patient) %>% complete(grp = GRP_NT, tissue, sig, fill = list(n = 0)) %>% ungroup() %>%
+  mutate(m = ifelse(n >= 10, m, NA)) %>%
+  group_by(patient, sig) %>% mutate(z = (m - mean(m, na.rm = TRUE)) / sd(m, na.rm = TRUE)) %>% ungroup() %>%
+  mutate(tis = TIS_NT[tissue],
+         row = paste0(grp, " · ", tis, " (n=", n, ")"),
+         ord = match(grp, GRP_NT) * 10 + match(tissue, names(TIS_NT)),
+         sig = lab_sig(sig),
+         sig = ifelse(sig %in% c("Exhaustion", "Tissue residency"), paste0(sig, " *"), sig))
+nt_m <- nt_m %>% group_by(patient) %>%
+  mutate(row = factor(row, levels = rev(unique(row[order(ord)])))) %>% ungroup()
+ggplot(nt_m, aes(sig, row, fill = z)) + geom_tile(colour = "white") +
+  geom_text(aes(label = ifelse(is.na(z), "", sprintf("%.2f", z)), colour = abs(z) > 1.2),
+            size = 2.8, show.legend = FALSE, na.rm = TRUE) +
+  facet_wrap(~patient, scales = "free_y", ncol = 2) +
+  scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "black"), na.value = "black") +
+  scale_fill_gradient2(low = "#2166ac", mid = "grey97", high = "#b2182b", limits = c(-2, 2),
+                       oob = squish, na.value = "grey90", name = "z-score") +
+  labs(x = NULL, y = NULL,
+       caption = paste("Number and colour = z-score of the group mean within each signature (column),",
+                       "computed within each patient. Grey = < 10 cells.\n",
+                       "* unreliable in inDrop (genes detected in < 10 % of cells).")) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1), panel.grid = element_blank(),
+        strip.text = element_text(face = "bold", size = 11))
+```
+
+```{r sig_nt_delta}
+nt_m %>% filter(n >= 10) %>% select(patient, grp, tis, sig, m) %>%
+  group_by(patient, grp, sig) %>% filter("Tumour" %in% tis) %>%
+  mutate(d = m[tis == "Tumour"] - m) %>% ungroup() %>% filter(tis != "Tumour") %>%
+  mutate(d = sprintf("%+.2f", d), tis = paste("Tumour −", tis)) %>%
+  select(patient, grp, tis, sig, d) %>% pivot_wider(names_from = sig, values_from = d) %>%
+  arrange(patient, match(grp, GRP_NT), tis) %>%
+  rename(Patient = patient, Group = grp, Comparison = tis) %>%
+  kable(caption = "Tumour − other tissue: difference in mean signature score, same patient and group (≥ 10 cells in both tissues).")
+```
+
+* **Tumour vs blood (BC01, BC04) and vs lymph node (BC02).** All 11 group comparisons with enough
+  cells go the same way. Tumour cells have:
+  * higher cytotoxicity (+0.16 to +0.44);
+  * higher IFN-γ (+0.14 to +0.80);
+  * lower naive/memory (−0.03 to −0.94).
+
+  This holds for γδ cells (BC02 vs lymph node, BC04 vs blood) and for αβ CD8, CD4 and Treg cells.
+  It is a general tissue effect on T cells, not something specific to γδ cells.
+* **Tumour vs normal breast (BC01, BC02, BC03).** The differences are small and change direction
+  between patients. γδ cells can only be compared in BC02, where tumour γδ cells are *less*
+  cytotoxic than normal-breast γδ cells (−0.91). Normal breast and tumour T cells are both
+  tissue-resident populations, so the big contrast is tissue vs blood/lymph node, not tumour vs
+  normal tissue.
+* Patients: 2 for blood, 1 for lymph node, 3 for normal. This is descriptive only.
+
+# Conclusions
+
+**Solid**
+
+1. γδ T cells are a **minor population** in breast tumours: 1.8–3.1 % of T cells (10x, 3 patients);
+   0.2–3 % of T/NK cells in inDrop (8 patients, likely underestimated).
+2. **Vδ1 and Vγ9Vδ2 coexist** in tumours, with a patient-dependent balance (Vγ9Vδ2 > Vδ1 in BC09; Vδ1 >
+   Vδ2 in BC10 and BC11) — Vδ1 does not uniformly dominate.
+3. **No IL-17 programme**: IL17A/IL17F detected in no γδ cell across 11 patients (consistent with the
+   rarity of γδT17 cells in human tumours).
+4. Tumour γδ cells are **cytotoxic/IFN-γ effectors, comparable to αβ CD8 cells**, and their most
+   distinctive feature is an **NK-receptor programme** (NKG2A, TYROBP) absent from αβ cells (3/3 patients).
+5. **Methodology**: γδ identification requires TRDC plus exclusion of αβ-TCR cells; TRDV1 and TRGC1/2 are
+   not γδ-specific; STCAT does not recover γδ cells; 3' low-depth data cannot resolve Vδ subsets.
+
+**Suggestive** (consistent direction, few patients)
+
+6. **Vδ1** cells show more dysfunction markers (PD-1, TIGIT, TOX) and **Vδ2** cells an innate-like
+   (CD161, IL-12/IL-18 receptors, NKG2A) and memory programme — 3/3 patients, effect driven by BC09.
+7. A **tumour-resident effector Vδ1 state with dysfunction features** is shared by all 3 patients.
+8. Tumour γδ cells appear more activated than blood γδ cells (one patient, BC04).
+
+**Not answerable with this dataset**
+
+* Association with clinical subtype, grade or outcome (1–5 patients per group; the 3 patients with Vδ
+  resolution have no clinical data).
+* General tumour vs normal / lymph node differences (1–2 patients with paired tissues).
+* Whether Vδ1 "dysfunction" is functional (RNA only).
+
+**Hypotheses for follow-up**: NKG2A on Vδ2 cells (possible relevance of NKG2A blockade); PD-1/TIGIT on
+Vδ1 cells (checkpoint inhibitors); patient-dependent Vδ1/Vδ2 balance (relevant for Vγ9Vδ2-specific
+strategies such as aminobisphosphonates). These need a larger cohort with TCR data (e.g. Bassez 2021,
+5' + TCR, ~30 patients with anti-PD-1 response).
+
+# Limitations and next steps
+
+* **Vδ1 vs Vδ2 only in 10x** (3 patients, tumour only, no clinical data). Clinical association is only
+  possible with total γδ cells in inDrop (8 patients).
+* inDrop detects TRDC in only a fraction of true γδ cells (*dropout*): proportions are probably
+  **underestimated** and only roughly comparable between samples.
+* Signatures: with 3 patients in 10x, Vδ1/Vδ2 differences are descriptive; γδ subclusters partly reflect
+  the patient.
+* The 10x cells are **sorted CD3⁺ T cells**: γδ cells with an NK-like phenotype and low CD3 may be
+  under-represented, and filters based on NK markers cannot be calibrated on these data.
+* Proposed next step: validate the Vδ1/Vδ2 signatures and the clinical association in cohorts with more
+  patients and subtypes (e.g. Wu 2021, Bassez 2021).
+
+# Appendix A — Identification and validation of the γδ call {-}
+
+This appendix documents why the γδ call can be trusted. Here αβ T cells are analysed only as a negative
+control.
+
+## A.1 Calibration with the 10x TCR data {-}
+
+* The 2018 V(D)J kit only amplifies **TRA/TRB**; TRD/TRG contigs are V-only fragments without J/C →
+  not usable as positive evidence. The TCR is used as **negative evidence** (no αβ pair).
+* γδ cells transcribe germline TRAC/TRBC and often carry **non-productive** TRB contigs, so confidence
+  tiers are based on **productive** chains.
+
+```{r calib}
+x <- tnk10 %>% mutate(TRDC_pos = cnt10$TRDC_counts[match(cell, cnt10$cell)] > 0)
+x %>% count(`TRDC > 0` = TRDC_pos, `Productive αβ pair` = ab_pair,
+            `Any clonotype` = has_clonotype == "True") %>%
+  kable(caption = "10x: TRDC vs TCR. TRDC⁺ cells without an αβ pair almost never have a clonotype, as expected for γδ cells (the kit only reads α/β).")
+```
+
+* **10x** — `gdT_high`: TRDC⁺ with no productive α or β chain; `gdT_medium`: TRDC⁺ with a single
+  productive chain, or TRDV1/2⁺ with no productive chain; `TRDC+_abPair`: excluded (doublets/ambient).
+* **inDrop** — `gdT_medium`: TRDC⁺ and CD3⁺; `TRDC+_CD3neg`: excluded (possible germline TRDC in NK cells).
+
+```{r calls}
+bind_rows(tnk10 %>% count(gd_call) %>% mutate(platform = "10x"),
+          tnkid %>% count(gd_call) %>% mutate(platform = "inDrop")) %>%
+  pivot_wider(names_from = platform, values_from = n, values_fill = 0) %>%
+  kable(caption = "Number of cells per category.")
+```
+
+## A.2 TRDC, marker call and STCAT on UMAP {-}
+
+STCAT (Guo lab, *Science Bulletin* 2025) is a hierarchical, CellTypist-based T-cell annotator with a
+**Tgd** class at its first level. Shown side by side: **TRDC** expression, the marker-based call, cells
+labelled **Tgd** by STCAT (final or per-cell) and the per-cell probability **P(Tgd)**.
+
+**10x (tumour, T cells)**
+
+```{r umap_cmp_10x, fig.width=12, fig.height=10}
+(umap_gene(tnk10, "TRDC", "TRDC expression") |
+   umap_cat(tnk10, "gd_call", "Marker/TCR call", PAL_CALL,
+            highlight = c("gdT_high", "gdT_medium", "TRDC+_abPair"))) /
+(umap_cat(tnk10, "stcat_Tgd", "STCAT: Tgd", PAL_ST, highlight = "Tgd") |
+   umap_gene(tnk10, "stcat_P_Tgd", "STCAT: per-cell P(Tgd) (0–1 scale)", limits = c(0, 1)))
+```
+
+**inDrop (T/NK, all tissues)**
+
+```{r umap_cmp_indrop, fig.width=12, fig.height=10}
+(umap_gene(tnkid, "TRDC", "TRDC expression") |
+   umap_cat(tnkid, "gd_call", "Marker call", PAL_CALL,
+            highlight = c("gdT_medium", "TRDC+_CD3neg"))) /
+(umap_cat(tnkid, "stcat_Tgd", "STCAT: Tgd", PAL_ST, highlight = "Tgd") |
+   umap_gene(tnkid, "stcat_P_Tgd", "STCAT: per-cell P(Tgd) (0–1 scale)", limits = c(0, 1)))
+```
+
+* In **10x**, γδ cells form a well-defined group (left), TRDC⁺ and without an αβ pair. STCAT's few *Tgd*
+  cells **do not fall on that group**. `TRDC+_abPair` cells (blue) are spread across the αβ
+  compartment, as expected for doublets or ambient TRDC.
+* In **inDrop**, TRDC concentrates in the NK-like/cytotoxic region. STCAT discards almost half of the
+  compartment as **"None T"** (dark grey) because CD3 is not detected in many inDrop cells. For the same
+  reason, our CD3⁺ requirement leaves many cells of that region as `TRDC+_CD3neg`: some are NK cells
+  with germline TRDC, others probably γδ cells with CD3 *dropout*. The inDrop call is therefore
+  **conservative**.
+
+## A.3 Specificity of individual markers and validation of STCAT {-}
+
+```{r umap_markers_10x, fig.width=12, fig.height=6.5}
+wrap_plots(lapply(c("TRDV1", "TRDV2", "TRGV9", "TRGC1", "TRGC2", "TRAC"),
+                  function(g) umap_gene(tnk10, g)), ncol = 3) +
+  plot_annotation(title = "10x — all T cells")
+```
+
+For each marker, "positive cell" (> 0 UMI) is taken as reference: the fraction of positive cells that
+also carry a productive αβ pair (marker specificity, 10x only), the fraction labelled *Tgd* by STCAT,
+and the AUC of P(Tgd) for separating positive from negative cells (0.5 = chance).
+
+```{r validation}
+val <- function(d, plat) {
+  bind_rows(lapply(c("TRDC", "TRDV1", "TRDV2", "TRGV9", "TRGC1", "TRGC2"), function(g) {
+    pos <- d[[g]] > 0
+    tibble(Platform = plat, Marker = g, `Positive cells` = sum(pos),
+           `% with αβ pair` = if ("ab_pair" %in% names(d)) round(100 * mean(d$ab_pair[pos]), 1) else NA,
+           `% STCAT Tgd` = round(100 * mean(d$stcat_Tgd[pos] == "Tgd"), 1),
+           `AUC P(Tgd)` = round(auc(d$stcat_P_Tgd, pos), 3))
+  }))
+}
+bind_rows(val(tnk10, "10x"), val(tnkid, "inDrop")) %>%
+  kable(caption = "Marker specificity and STCAT vs each marker. In inDrop TRDV1/TRDV2 are barely detected.")
+```
+
+```{r stcat_side}
+st <- function(d, plat) {
+  t <- d$stcat_Tgd == "Tgd"
+  tibble(Platform = plat, `Tgd cells (STCAT)` = sum(t),
+         `% TRDC+ among Tgd` = round(100 * mean(d$TRDC[t] > 0), 1),
+         `% TRDC+ background` = round(100 * mean(d$TRDC > 0), 1),
+         `% marker-defined γδ recovered by STCAT` = round(100 * mean(d$stcat_Tgd[d$is_gdT] == "Tgd"), 1))
+}
+bind_rows(st(tnk10, "10x"), st(tnkid, "inDrop")) %>%
+  kable(caption = "From STCAT's side: its few Tgd cells are enriched for TRDC (specific), but it recovers very few γδ cells (insensitive).")
+```
+
+* **TRDV1 and TRGC1/TRGC2 alone are not γδ-specific**: more than half of the positive cells carry a
+  productive αβ TCR (the γ locus is not deleted in αβ cells and is transcribed; TRDV1 appears in hybrid
+  transcripts). **TRDC** and **TRDV2** are the most reliable markers; combined with the absence of an
+  αβ pair they give the cleanest call.
+* **STCAT** rarely assigns *Tgd* and its P(Tgd) does not separate γδ cells by any marker. Moreover, it
+  chooses the CD4/CD8 branch with the rule `CD8 > CD4`: γδ cells are usually **CD4⁻CD8⁻**, the 0/0 tie
+  falls into the CD4 branch, and Vγ9Vδ2 cells end up as *"CD4 Tem cytotoxicity"*:
+
+```{r stcat_of_gd, fig.width=9, fig.height=4}
+keep <- gd10 %>% count(stcat_label) %>% filter(n >= 10) %>% pull(stcat_label)
+gd10 %>% filter(!is.na(gd_subset)) %>%
+  mutate(stcat_label = ifelse(stcat_label %in% keep, stcat_label, "other")) %>%
+  count(gd_subset, stcat_label) %>%
+  group_by(gd_subset) %>% mutate(f = n / sum(n)) %>% ungroup() %>%
+  ggplot(aes(f, gd_subset, fill = stcat_label)) + geom_col() +
+  scale_x_continuous(labels = percent) +
+  labs(x = "% of cells", y = NULL, fill = "STCAT label",
+       title = "10x: final STCAT label of marker-defined γδ cells")
+```
+
+## A.4 TCR genes without TCR sequencing: TRDC, TRDV, TRGC, TRAC/TRBC and a combined score {-}
+
+Added in October 2026 to support the analysis of 3' datasets without TCR data (Klughammer et al. 2024),
+where the question was raised why TRDC is used alone and not a combined score: **TRDC/TRGC1/TRGC2
+positive, TRAC/TRBC1/TRBC2 negative, CD3E high, CD4 negative**. In 10x the TCR gives an independent
+answer.
+
+```{r a4_load}
+spec  <- read.csv(file.path(DAT, "marker_specificity_tcr.csv"), check.names = FALSE)
+cgen  <- read.csv(file.path(DAT, "constant_genes_gd_vs_ab.csv"), check.names = FALSE)
+crul  <- read.csv(file.path(DAT, "combined_rules.csv"), check.names = FALSE)
+```
+
+**1. Specificity of each gene, using only the TCR.** For each gene, the fraction of positive cells that
+carry a productive αβ pair (i.e. are αβ T cells). This criterion does not use the γδ call, so it does not
+favour TRDC.
+
+```{r a4_spec}
+spec %>% kable(caption = "10x: % of marker-positive cells (> 0 UMI) with a productive αβ pair or with no productive chain. Baseline: 83 % of all cells have an αβ pair.")
+```
+
+* **TRDV2** and **TRDC** are the most specific genes (12 % and 31 % αβ); TRDC with TRGC is more specific
+  (17 %) but covers fewer cells. TRDV genes are only useful with 5' chemistry: in 3' data they are
+  essentially not detected.
+* **TRDV1** and **TRGC1/TRGC2** are mostly in αβ cells (54–78 %).
+* **Cells with no TRAC/TRBC transcript are mostly αβ cells** (74 % with a productive αβ pair): absence of
+  TRAC/TRBC reflects dropout, not γδ identity.
+
+**2. γδ cells express TRAC and TRBC.**
+
+```{r a4_det}
+cgen %>% kable(caption = "10x: detection in γδ cells (gdT_high/medium) vs cells with a productive αβ pair.")
+```
+
+γδ cells transcribe the TRA and TRB constant regions at least as often as αβ cells (germline
+transcription); only 2.1 % of γδ cells have TRAC, TRBC1 and TRBC2 all at zero (6.2 % of αβ cells).
+KLRF1 and FCER1G are almost absent from γδ cells here, but these are sorted CD3⁺ T cells: NK-like γδ
+cells with low CD3 are probably under-represented, so this dataset cannot tell how many γδ cells an
+NK-marker filter would remove in an unsorted dataset.
+
+**3. Combined rules.**
+
+```{r a4_rules}
+crul %>% filter(!grepl("AUC", rule)) %>%
+  kable(caption = "10x: combined rules vs the γδ call.")
+```
+
+* Requiring TRAC/TRBC negativity recovers about 1 % of γδ cells.
+* As a continuous score (mean z of TRDC, TRGC1, TRGC2 minus mean z of TRAC, TRBC1, TRBC2) the AUC for γδ
+  vs αβ cells is `r crul$precision[grepl("continuous", crul$rule)]`, versus `r crul$precision[grepl("TRDC alone", crul$rule)]` for TRDC alone: adding
+  TRGC and subtracting TRAC/TRBC does not improve on TRDC.
+
+# Appendix B — Methods {-}
+
+QC filters: 10x — 200–6000 genes, ≤ 15 % mitochondrial; inDrop — 150–5000 genes, ≤ 25 % mitochondrial
+(inDrop is much shallower). Genes detected in < 3 cells removed.
+
+```{r qc, results="asis"}
+cat(paste0("* `", trimws(qc), "`"), sep = "\n")
+```
+
+Scripts in `~/single_cell/Azizi/`: `01_prepare_dataset.py` (loading and QC), `02_process_and_TNK.py`
+(normalisation, HVG, PCA, Harmony by sample, UMAP, Leiden, T/NK compartment), `03_gd_calling.py`
+(γδ call), `04_stcat.py` (STCAT 1.1, conda env `stcat`, Python 3.9), `05_export_for_report.py` (tables
+for this report), `06_gd_signatures.py` (state signatures), `07_constant_region_markers.py` (TCR genes
+and combined score without TCR data, Appendix A.4). TCR V/J/C genes are excluded from HVGs so
+that clonality does not drive clustering.
+
+```{r session, echo=FALSE}
+cat(R.version.string, "\n")
+```

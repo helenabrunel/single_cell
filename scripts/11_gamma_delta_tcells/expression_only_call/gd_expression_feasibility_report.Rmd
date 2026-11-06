@@ -1,0 +1,456 @@
+---
+title: "γδ T cells in metastatic breast cancer — Klughammer et al. 2024 (HTAPP)"
+subtitle: "Feasibility of γδ T-cell identification without TCR data"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dev = "png", dpi = 110)
+suppressPackageStartupMessages({
+  library(ggplot2); library(dplyr); library(tidyr); library(patchwork)
+  library(scales); library(knitr)
+})
+ROOT <- ".."
+DAT  <- file.path(ROOT, "report", "data")
+theme_umap <- theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 11),
+        legend.key.size = unit(0.35, "cm"), legend.text = element_text(size = 8))
+theme_set(theme_bw(base_size = 11))
+
+umap_cat <- function(d, col, title = col, pal = NULL, size = 0.3, highlight = NULL, size_hi = 1.1) {
+  d <- d[order(d[[col]] %in% highlight), ]
+  d$.sz <- ifelse(d[[col]] %in% highlight, size_hi, size)
+  p <- ggplot(d, aes(UMAP1, UMAP2, colour = .data[[col]], size = .sz)) +
+    geom_point(stroke = 0, shape = 16) + scale_size_identity() + ggtitle(title) + theme_umap +
+    guides(colour = guide_legend(override.aes = list(size = 3), title = NULL))
+  if (!is.null(pal)) p <- p + scale_colour_manual(values = pal)
+  p
+}
+umap_gene <- function(d, g, title = g, size = 0.3, size_hi = 1.1) {
+  d <- d[order(d[[g]]), ]
+  d$.sz <- ifelse(d[[g]] > 0, size_hi, size)
+  ggplot(d, aes(UMAP1, UMAP2, colour = .data[[g]], size = .sz)) +
+    geom_point(stroke = 0, shape = 16) + scale_size_identity() + ggtitle(title) + theme_umap +
+    scale_colour_gradientn(colours = c("grey88", "#fdae61", "#d73027", "#67001f"), name = NULL)
+}
+PAL_CALL <- c(gdT = "#b2182b", `TRDC+_CD4CD8B` = "#4393c3", `TRDC+_NKlike` = "#984ea3",
+              `TRDC+_CD3neg` = "#92c5de", non_gd = "grey85")
+```
+
+```{r load}
+clin <- read.csv(file.path(ROOT, "data/clinical_patients.csv"), stringsAsFactors = FALSE)
+um   <- read.csv(gzfile(file.path(DAT, "tnk_umap.csv.gz")), stringsAsFactors = FALSE)
+det  <- read.csv(file.path(DAT, "detection_by_type.csv"), check.names = FALSE)
+rule <- read.csv(file.path(DAT, "rule_calibration.csv"), check.names = FALSE)
+dep  <- read.csv(file.path(DAT, "depth_stratified.csv"), check.names = FALSE)
+bpp  <- read.csv(file.path(DAT, "background_per_patient.csv"), check.names = FALSE)
+bg   <- read.csv(file.path(ROOT, "figures/04_decontx/background_test.csv"), check.names = FALSE)
+val  <- read.csv(file.path(ROOT, "figures/03_gd_calling/validation_genes_not_in_rule.csv"),
+                 check.names = FALSE)
+# follow-up (October 2026)
+pos   <- read.csv(file.path(ROOT, "figures/06_combined_rule/positive_markers.csv"), check.names = FALSE)
+azdet <- read.csv(file.path(ROOT, "figures/06_combined_rule/azizi_detection_gd_vs_ab.csv"), check.names = FALSE)
+azrul <- read.csv(file.path(ROOT, "figures/06_combined_rule/azizi_rules.csv"), check.names = FALSE)
+kbg   <- read.csv(file.path(ROOT, "figures/06_combined_rule/klughammer_rules_background.csv"), check.names = FALSE)
+cd3e  <- read.csv(file.path(DAT, "cd3e_by_celltype.csv"), check.names = FALSE)
+cd3n  <- read.csv(file.path(DAT, "cd3e_nk_noT.csv"), check.names = FALSE)
+nkco  <- read.csv(file.path(DAT, "nk_cd3e_coexpression.csv"), check.names = FALSE)
+nksub <- read.csv(file.path(DAT, "nk_subclusters.csv"), check.names = FALSE)
+nkref <- read.csv(file.path(DAT, "nk_tlike_vs_references.csv"), check.names = FALSE)
+nkum  <- read.csv(gzfile(file.path(DAT, "nk_umap.csv.gz")), stringsAsFactors = FALSE)
+log06 <- readLines(file.path(ROOT, "logs/06_combined_rule_test.log"))
+auc_s <- as.numeric(sub(".*= ", "", grep("AUC γδ vs αβ", log06, value = TRUE)))
+auc_d <- as.numeric(sub(".*= ", "", grep("AUC of TRDC alone", log06, value = TRUE)))
+ab0   <- as.numeric(regmatches(grep("TRAC=TRBC1=TRBC2=0", log06, value = TRUE),
+                               gregexpr("[0-9.]+(?= %)", grep("TRAC=TRBC1=TRBC2=0", log06, value = TRUE), perl = TRUE))[[1]])
+tl    <- nksub[nksub$`T-like` %in% c(TRUE, "True"), ]
+dbg   <- read.csv(file.path(DAT, "doublets_by_group.csv"), check.names = FALSE)
+umi   <- read.csv(file.path(DAT, "nk_tlike_umi_doublet_expectation.csv"), check.names = FALSE)
+nkbt  <- read.csv(file.path(DAT, "nk_tlike_background_test.csv"), check.names = FALSE)
+csc   <- read.csv(file.path(DAT, "combined_score_call.csv"), check.names = FALSE)
+csv_  <- read.csv(file.path(DAT, "combined_score_validation.csv"), check.names = FALSE)
+```
+
+# Summary
+
+* **Question.** Can γδ T cells be identified in the Klughammer metastatic breast cancer atlas
+  (10x 3', no TCR sequencing), as was done for Azizi et al. 2018?
+* **Answer: not among the cells annotated as T.** In this dataset TRDC — the only γδ marker that is
+  detected — is **more frequent in cells that are certainly αβ T cells (CD4⁺ or CD8B⁺) than in γδ
+  candidates**, at every sequencing depth and in 21/22 patients. The same test cleanly separates γδ from
+  αβ cells in Azizi, where the TCR provides the truth. The same holds for a T-like subpopulation found among cells annotated as NK (see below).
+* **TRDV genes are not detected** (≤ 0.4 % of TRDC⁺ cells), so Vδ1/Vδ2 subsets cannot be studied either.
+* **Ambient-RNA correction (decontX) and alternative markers (TRGC1, TRGC2, TRGV9, combinations) do not
+  rescue the signal.**
+* **Implication.** Any γδ annotation of this atlas based on TRDC (including automated annotators) would
+  consist mostly of αβ T cells.
+* **Open point (follow-up, Section 5).** The expression rule excluded cells with NK markers, and the
+  background test used only cells annotated as T, so the cells annotated as NK were never evaluated as
+  possible γδ cells. Re-clustering them reveals **`r sum(tl$n)` cells (`r percent(sum(tl$n) / 3496, 1)` of NK, present in at least `r max(tl$patients)` patients)
+  with T-cell transcripts**. They are not NK+T doublets (UMI content of a single cell), and inside them
+  TRDC/TRGC are at least as frequent in CD8B⁺ (αβ) cells as in CD8B⁻ cells: no γδ signal, as in the T cells.
+* **Combined constant-region rule** (TRDC/TRGC⁺, TRAC/TRBC⁻, CD3E⁺, CD4⁻): it does not work, because
+  γδ cells validated by TCR also express TRAC/TRBC (Section 5.4).
+* Studying γδ cells with clinical association requires a dataset with TCR data, e.g. **Bassez et al.
+  2021** (5' + TCR, ~30 patients, anti-PD-1 response).
+
+# Data
+
+```{r cohort}
+clin %>% transmute(Patient = patient, Assay = assay, `Biopsy site` = site_biopsy,
+                   Receptors = receptors_biopsy, Subtype = subtype, Stage = stage_at_diagnosis,
+                   Presentation = metastatic_presentation, Age = age, `T cells` = n_T, `NK cells` = n_NK) %>%
+  kable(caption = "Patients with T/NK cells (28 of 30; one metastatic biopsy each). Subtype from biopsy receptors: HER2+ if HER2+; HR+ if ER+ or PR+ (incl. PR-low); otherwise TNBC.")
+```
+
+T/NK cells as annotated by the authors (`author_cell_type` = T or NK; `r format(nrow(um), big.mark = ",")`
+cells), raw counts from the CELLxGENE release; Harmony (by patient) + Leiden for the embedding.
+
+# Approach
+
+Without TCR data, γδ cells must be identified from expression alone. The rule was **calibrated on the
+Azizi 10x data**, where the TCR tells which TRDC⁺ cells are γδ (no productive αβ pair).
+
+**Cells included.** Both cells annotated as T and cells annotated as NK were included, because γδ cells
+share a cytotoxic programme with NK cells and could have been annotated as NK.
+
+**Positive marker: why TRDC.** Every TCR gene that could mark γδ cells was considered (details in the
+Azizi report, Appendix A.4, where the TCR gives an independent truth):
+
+* **TRDV1/TRDV2/TRDV3** — the most direct markers in 5' data (TRDV2⁺ cells: 12 % αβ in Azizi), but
+  essentially **not detected in this 3' dataset** (≤ 0.4 % of TRDC⁺ cells; Section 4.1).
+* **TRAC/TRBC1/TRBC2 as negative markers** — γδ cells transcribe them (81 %, 70 %, 79 % in Azizi γδ
+  cells), and cells without TRAC/TRBC transcripts are mostly αβ cells with a productive αβ pair (74 %),
+  i.e. dropout (Section 5.4).
+* **TRGC1/TRGC2** — mostly transcribed by αβ cells: 68 % and 78 % of TRGC1⁺/TRGC2⁺ cells in Azizi carry
+  a productive αβ pair (TRDC⁺: 31 %).
+* **TRDC** — the most specific constant-region gene and the only γδ gene detected here.
+
+Constant-region markers and combinations, against the γδ call in Azizi and with the Klughammer
+background test:
+
+```{r positive}
+pos %>% kable(caption = "γδ constant-region markers, alone and with the exclusion filters (CD3⁺ CD4⁻ CD8B⁻ KLRF1⁻ FCER1G⁻). Precision/recall against the TCR call in Azizi 10x; background ratio in Klughammer (Section 4.3; > 1 = γδ signal).")
+```
+
+* **TRGC1/TRGC2** are also transcribed by αβ T cells: alone, only 10–19 % of TRGC⁺ cells are γδ.
+  Adding them to TRDC (TRDC *or* TRGC) raises recall but lowers precision from 0.88 to 0.55.
+* Requiring **TRDC *and* TRGC** gives the highest precision (0.92) but loses most γδ cells (recall 0.27).
+* TRDC was therefore the only positive marker. In Klughammer the choice does not change the conclusion:
+  **every** marker or combination has a background ratio < 1.
+
+**Exclusion criteria.**
+
+* **TRAC/TRBC cannot be used** — true γδ cells express germline TRAC/TRBC at levels ≥ αβ cells
+  (Section 5.4).
+* **CD4 and CD8B** (CD8αβ) are almost absent from γδ cells (0 % and 4 % vs 31 % and 40 % in αβ cells) →
+  used to exclude αβ cells.
+* **KLRF1 and FCER1G** exclude NK cells, because TRDC is detected in 83 % of cells annotated as NK.
+  *Limitation identified afterwards:* this filter was validated in Azizi 10x, which contains only sorted
+  CD3⁺ T cells, so it could not reveal γδ cells with an NK phenotype. In Klughammer it reduces the cells
+  annotated as NK that pass the rule from 1,279 to 29, i.e. it largely undoes the inclusion of NK cells
+  (Section 5).
+
+```{r rule}
+rule %>% kable(caption = "Expression rules: precision/recall against the TCR-based call in Azizi 10x, and cells passing each rule in Klughammer. The final rule gives 88 % precision in Azizi and selects 3.9 % of Klughammer T cells.")
+```
+
+# Results
+
+## TRDV genes are not detected; TRDC is widespread
+
+```{r detection}
+det %>% rename(`% of author T cells` = T, `% of author NK cells` = NK) %>%
+  kable(caption = "Detection (> 0 UMI) of TCR and lineage genes.")
+```
+
+* TRDV1/TRDV2/TRDV3 are essentially absent (3' chemistry captures the constant region) → no Vδ subsets.
+* TRDC is detected in **83 % of NK cells** and **14 % of T cells** — far above the
+  expected γδ frequency (2.7 % in Azizi 10x).
+* **CD3E is detected in 34.7 % of cells annotated as NK.** This is analysed in Section 5.1–5.2: part of it
+  is not explained by T-cell transcripts, and part comes from a subpopulation with a T-cell profile.
+
+## No γδ population emerges on the UMAP
+
+```{r umap, fig.width=12, fig.height=8}
+(umap_cat(um, "author_cell_type", "Author label") | umap_gene(um, "TRDC", "TRDC expression") |
+   umap_cat(um, "gd_call", "Expression-rule call", PAL_CALL, highlight = c("gdT"))) /
+(umap_gene(um, "CD8B") | umap_gene(um, "KLRF1") | umap_gene(um, "TRGC2"))
+```
+
+In Azizi, γδ cells formed their own cluster (37 % γδ). Here, cells passing the rule are **scattered across
+the T-cell compartment**; no Leiden cluster has more than 7 % of them.
+
+Genes **not** used in the rule are only modestly enriched in the called cells, much less than in true γδ
+cells in Azizi:
+
+```{r validation}
+val %>% rename(Gene = 1) %>%
+  kable(caption = "% detection of genes not used in the rule. Klughammer calls vs TRDC⁻ T cells, and TCR-validated γδ vs αβ cells in Azizi 10x.")
+```
+
+## Background test: TRDC is not γδ-specific in this dataset
+
+If TRDC marked γδ cells, it should be much more frequent among **γδ candidates** (T cells, CD3⁺, CD4⁻
+CD8B⁻, no NK markers) than among **sure αβ cells** (CD4⁺ or CD8B⁺). The ratio candidates/αβ is the key
+number (> 1 = γδ signal):
+
+```{r bg_table}
+bg %>% transmute(Data = data, Marker = marker, `% in sure-αβ`, `% in DN candidates`,
+                 `Ratio DN/αβ` = `ratio DN/αβ`) %>%
+  kable(caption = "Background test for several markers. Azizi 10x (5', TCR-validated) is the positive control.")
+```
+
+* In **Azizi**, TRDC is 5× more frequent in candidates (and TRDC + TRGC 10×): the test works.
+* In **Klughammer**, every marker has a ratio **< 1**: TRDC, TRGC1, TRGC2 and their combinations are
+  *more* frequent in sure αβ cells. TRGC1/2 are not γδ-specific even in Azizi.
+
+**Not a sequencing-depth artefact.** Sure-αβ cells have more UMIs (CD4/CD8B are easier to detect in deeper
+cells), so the comparison was repeated within UMI-depth bins:
+
+```{r depth, fig.width=9, fig.height=3.5}
+dep %>% pivot_longer(c(`sure-αβ`, `DN candidates`), names_to = "group", values_to = "pct") %>%
+  ggplot(aes(factor(bin), pct, fill = group)) + geom_col(position = "dodge") +
+  facet_wrap(~dataset, scales = "free_y") +
+  scale_fill_manual(values = c(`sure-αβ` = "#4393c3", `DN candidates` = "#b2182b")) +
+  labs(x = "UMI-depth quintile (1 = shallowest)", y = "% TRDC⁺", fill = NULL)
+```
+
+The pattern holds in every depth bin: candidates > αβ in Azizi, αβ > candidates in Klughammer.
+
+**Per patient** (≥ 30 cells per group):
+
+```{r per_patient, fig.width=9, fig.height=4}
+ct <- cor.test(bpp$`sure-αβ`, bpp$pct_NK, method = "spearman", exact = FALSE)
+n_up <- sum(bpp$`DN candidates` > bpp$`sure-αβ`)
+p1 <- ggplot(bpp, aes(`sure-αβ`, `DN candidates`, colour = assay)) +
+  geom_abline(linetype = 2, colour = "grey50") + geom_point(size = 2.5) +
+  coord_equal() + labs(x = "% TRDC⁺ in sure-αβ", y = "% TRDC⁺ in DN candidates", colour = NULL,
+                       title = "Below the diagonal = no γδ signal") +
+  theme(legend.position = "bottom")
+p2 <- ggplot(bpp, aes(pct_NK, `sure-αβ`, colour = assay)) + geom_point(size = 2.5) +
+  labs(x = "% NK cells in T/NK", y = "% TRDC⁺ in sure-αβ", colour = NULL,
+       title = sprintf("Spearman ρ = %.2f, p = %.3f", ct$estimate, ct$p.value)) +
+  theme(legend.position = "bottom")
+p1 + p2
+```
+
+* `r n_up` of `r nrow(bpp)` patients show more TRDC in candidates than in αβ cells.
+* The TRDC background in αβ cells **increases with the NK content** of the sample and is higher with the
+  3' v2 chemistry, which points to ambient RNA from NK cells; germline transcription of the TRA/TRD locus in
+  αβ cells may also contribute. The two cannot be separated here.
+
+## Ambient-RNA correction (decontX) does not help
+
+decontX (celda 1.26) was run per sample on the **whole atlas** (all 157,531 cells, author cell types as
+clusters). Estimated contamination of T/NK cells was low (median `r sprintf("%.1f %%", 100 * median(um$decontX_contamination, na.rm = TRUE))`),
+and TRDC was removed from only 40 of 6,522 TRDC⁺ cells. The background-test ratios are unchanged
+(table above, "Klughammer decontX"). Because TRDC is part of both the T and NK expression profiles,
+decontX treats it as native rather than ambient.
+
+# Follow-up: cells annotated as NK and the combined constant-region rule
+
+Added in October 2026 after review of the first version: (i) 34.7 % of cells annotated as NK express
+CD3E; (ii) the cells annotated as NK were never evaluated as γδ (NK-marker filter, background test on
+cells annotated as T); (iii) proposal of a combined score TRDC/TRGC1/TRGC2⁺, TRAC/TRBC1/TRBC2⁻,
+CD3E⁺, CD4⁻.
+
+## Where CD3E in NK-annotated cells comes from
+
+If CD3E in a cell type came from T cells (ambient RNA, doublets, mislabelled T cells), it should come
+with CD3D in the same proportion as in T cells.
+
+```{r cd3e}
+cd3e %>% filter(n >= 1000) %>% arrange(desc(CD3E)) %>%
+  select(`Cell type` = cell_type, n, CD3E, CD3D, CD3G, TRAC, TRBC2, CD8B, CD247, KLRF1, `CD3E/CD3D`) %>%
+  kable(caption = "% of cells with > 0 UMI, all author cell types with ≥ 1,000 cells (whole atlas, raw counts).")
+```
+
+```{r cd3e_noT}
+cd3n %>% rename(`Cell type` = cell_type) %>%
+  kable(caption = "Cells with none of CD3D, CD3G, TRAC, TRBC2, CD8B: % that express CD3E.")
+```
+
+* In T cells CD3E is detected somewhat less often than CD3D (ratio
+  `r cd3e$"CD3E/CD3D"[cd3e$cell_type == "T"]`). In the other cell types, the little CD3E present (1–4 %) comes with
+  CD3D in a similar proportion, as expected if it comes from T cells.
+* In cells annotated as NK the pattern is different: **more CD3E than CD3D** (ratio
+  `r cd3e$"CD3E/CD3D"[cd3e$cell_type == "NK"]`). If CD3E followed CD3D as in T cells, 22 % would be expected; 34.7 % is
+  observed. Among NK cells with no other T-cell transcript, `r cd3n$"% CD3E+"[cd3n$cell_type == "NK"]` % express CD3E,
+  versus ≤ 1 % in other cell types.
+* So part of the CD3E in NK-annotated cells is **not explained by T-cell transcripts** in this dataset.
+
+## NK-annotated cells with a T-cell profile
+
+```{r nk_cd3e}
+nkco %>% filter(!gene %in% c("CD3E")) %>%
+  kable(caption = "CD3E⁺ vs CD3E⁻ cells annotated as NK (% > 0 UMI), with author T cells as reference.")
+```
+
+CD3E⁺ NK-annotated cells express more CD3D, CD3G, TRAC and CD8B than CD3E⁻ ones, so some T-like cells are
+among them. NK-annotated cells were re-embedded and sub-clustered (Harmony by patient, Leiden 1.0):
+
+```{r nk_umap, fig.width=12, fig.height=6.5}
+nkum$T_like <- ifelse(nkum$T_like %in% c(TRUE, "True"), "T-like", "other")
+(umap_cat(nkum, "nk_sub", "NK-annotated cells: subclusters") |
+   umap_cat(nkum, "T_like", "T-like subclusters (CD3D > 50 %)", c(`T-like` = "#b2182b", other = "grey80"),
+            highlight = "T-like") | umap_gene(nkum, "CD3D")) /
+(umap_gene(nkum, "TRAC") | umap_gene(nkum, "TRGC1") | umap_gene(nkum, "CD8B"))
+```
+
+```{r nk_sub}
+nksub %>% select(subcluster, n, patients, `median UMI`, CD3E, CD3D, CD3G, TRAC, TRDC, TRGC1, TRGC2,
+                 CD8A, CD8B, CD5, IL7R, KLRF1, FCER1G, FCGR3A, `T-like`) %>%
+  kable(caption = "Subclusters of NK-annotated cells (% > 0 UMI). T-like = CD3D detected in > 50 % of cells.")
+```
+
+```{r nk_ref}
+nkref %>% mutate(across(-gene, ~ round(.x, 1))) %>%
+  mutate(`expected NK+T doublet` = ifelse(gene %in% c("n", "patients", "median UMI"), NA,
+           round(100 * (1 - (1 - `NK other subclusters` / 100) * (1 - `author T CD8B+` / 100)), 1))) %>%
+  kable(caption = "T-like subclusters vs the other NK-annotated cells, CD8B⁺ author T cells and TCR-validated γδ cells of Azizi 10x. 'Expected NK+T doublet': detection expected if each cell were an NK cell plus a CD8⁺ T cell.")
+```
+
+* **`r sum(tl$n)` cells** (`r percent(sum(tl$n) / 3496, 1)` of NK-annotated cells, in at least `r max(tl$patients)` patients) form T-like
+  subclusters: CD3D, TRAC and CD8A in 40–70 % of cells, together with NK genes (KLRF1, FCER1G in ~85 %).
+* They have more TRGC1 than the other NK cells and than CD8⁺ T cells, but about what an NK+T doublet would
+  give. Their T-cell genes are below the doublet expectation, and they have more UMIs than other NK cells.
+* They do **not** resemble the TCR-validated γδ cells of Azizi: KLRF1, FCER1G and FCGR3A are high (≤ 2 % in
+  Azizi γδ) and IL7R and CD5 low (83 % and 25 % in Azizi γδ). However, Azizi 10x contains only sorted
+  T cells, so it cannot show what NK-like γδ cells look like.
+* They could be NK-like γδ cells, NK-like αβ CD8 cells (CD8B in ~27 %) or NK+T doublets (next section).
+
+## Are the T-like NK cells doublets, and do they contain γδ cells?
+
+**Scrublet** was run per 10x channel on the whole atlas (all cell types, raw counts; expected rate 0.8 %
+per 1,000 cells; threshold 0.25).
+
+```{r dbl}
+dbg %>% kable(caption = "Scrublet doublet scores by group.")
+```
+
+Scrublet flags almost no doublets anywhere in the atlas (≤ 1.2 % in every cell type), probably because
+the published data were already filtered; it is also known to be weak for doublets of similar cell types
+such as NK + T. It is therefore not informative here. A more direct test: an NK+T doublet contains the
+RNA of two cells, so its UMI count should be close to NK + T.
+
+```{r umi}
+umi %>% kable(caption = "Median UMI per cell in the same patient (patients with ≥ 10 cells per group).")
+```
+
+The T-like cells have about the same UMI content as the other NK cells of the same patient (median ratio
+`r round(median(umi$"T-like" / umi$"NK other"), 2)`) and about half of the doublet expectation (ratio
+`r round(median(umi$"T-like" / umi$"NK + T (doublet expectation)"), 2)`); they are below 75 % of the doublet expectation in
+`r sum(umi$"T-like" < 0.75 * umi$"NK + T (doublet expectation)")` of `r nrow(umi)` patients.
+**They are single cells**: NK-like T cells (or NK cells with T-cell transcripts), not doublets.
+
+**γδ signal inside the T-like cells.** The background test of Section 4.3 was repeated within them:
+CD8B⁺ cells are αβ; if the CD8B⁻ ones contained γδ cells, TRDC/TRGC should be more frequent there.
+
+```{r nkbt}
+nkbt %>% kable(caption = "T-like NK cells: CD8B⁺ (αβ) vs CD8B⁻, also restricted to cells with CD3D and TRAC (comparable T-cell transcript content).")
+```
+
+TRDC, TRDC ≥ 2 UMI and TRGC1/TRGC2 are **as frequent or more frequent in the CD8B⁺ (αβ) cells**, also
+when both groups are restricted to CD3D⁺TRAC⁺ cells. As in the T cells, there is no detectable γδ signal:
+γδ cells may exist among them, but they cannot be told apart from αβ cells with these genes.
+
+## Combined constant-region rule
+
+Rule proposed: TRDC/TRGC1/TRGC2 positive, TRAC/TRBC1/TRBC2 negative, CD3E high, CD4 negative. Tested
+against the TCR truth in Azizi 10x:
+
+```{r az_det}
+azdet %>% rename(Gene = 1) %>%
+  kable(caption = "Azizi 10x: detection in TCR-validated γδ cells vs cells with a productive αβ pair.")
+```
+
+```{r az_rules}
+azrul %>% kable(caption = "Azizi 10x: rules vs the TCR call.")
+```
+
+* γδ cells validated by TCR **also express TRAC, TRBC1 and TRBC2** (germline transcription); only
+  `r ab0[1]` % have all three at zero (`r ab0[2]` % of αβ cells). Requiring TRAC/TRBC negativity therefore
+  recovers about 1 % of γδ cells.
+* As a continuous score (mean z of TRDC, TRGC1, TRGC2 minus mean z of TRAC, TRBC1, TRBC2), the AUC
+  for γδ vs αβ is `r auc_s`, versus `r auc_d` for TRDC alone.
+* "CD3E high" cannot be applied in Klughammer: CD3E is detected with 1 UMI in 65 % of CD3E⁺ T cells
+  (median 6 UMI in Azizi 5'), and requiring ≥ 2 UMI leaves 0 cells passing the rule.
+
+In Klughammer, without using the author labels:
+
+```{r k_rules}
+kbg %>% select(-`Azizi ratio DN/CD8B+`) %>%
+  mutate(`ratio DN/CD8B+` = ifelse(`% in CD8B+ (αβ)` == 0 & `% in CD4-CD8B-` > 0, "n/a (no CD8B⁺ cell can pass)",
+                                   as.character(`ratio DN/CD8B+`))) %>%
+  kable(caption = "Klughammer, all T/NK cells: cells passing each rule, how many are annotated as NK, and % in CD8B⁺ (αβ) vs CD4⁻CD8B⁻ cells. The CD4⁻CD8B⁻ group includes NK cells, so ratios > 1 here reflect NK cells.")
+```
+
+The few cells passing the combined rules are mostly NK-annotated (KLRF1⁺), consistent with the rule
+selecting NK cells with germline TRDC rather than γδ cells.
+
+**The combined score used directly as a call.** Among CD3E⁺ CD4⁻ cells, the cells with the highest score
+(top 1–10 %) were called γδ, with the same procedure in Azizi (positive control) and Klughammer (all T/NK
+cells, author labels not used). Background test as in Section 4.3, restricted to cells without NK
+markers: % of CD8B⁺ (αβ) vs CD8B⁻ cells called.
+
+```{r csc}
+csc %>% kable(caption = "Combined-score call. Precision/recall against the TCR call (Azizi only).")
+```
+
+```{r csv}
+csv_ %>% kable(caption = "Genes not in the score that differ between γδ and αβ cells in Azizi (% detected), in called cells without NK markers (top 3 %) vs the other CD3E⁺CD4⁻ cells without NK markers.")
+```
+
+* **In Azizi, the score selects mostly αβ cells** (precision 0.41 at the top 3 %, vs 0.88 for the TRDC rule)
+  and fails the background test (ratio < 1): TRGC2, which αβ CD8 cells also transcribe, drives the top of
+  the score. Ranking cells (AUC 0.83) is not the same as calling a rare population at the top.
+* **In Klughammer, 55–78 % of the top-scoring cells are NK-annotated (KLRF1/FCER1G⁺)**, and among the
+  others the background ratio is ≈ 1 (no γδ enrichment).
+* The genes not in the score shift in the γδ direction (more KLRC1/TYROBP, less CD5/CD28) — but the same
+  shift is seen in Azizi, where most called cells are αβ: it marks an NK-like/cytotoxic T-cell state, not
+  γδ identity.
+
+# Conclusions
+
+* Among cells annotated as T, γδ T cells **cannot be reliably identified at single-cell level**: the only
+  detectable γδ marker (TRDC) behaves as background, Vδ genes are not captured, and neither ambient-RNA
+  correction, TRGC-based markers nor a combined constant-region score rescue the signal.
+* Among cells annotated as NK there is a T-like subpopulation (`r sum(tl$n)` cells) that the first analysis did not
+  evaluate. They are single cells (not NK+T doublets), and within them TRDC/TRGC show no γδ signal
+  (as frequent in CD8B⁺ αβ cells as in CD8B⁻ cells). The conclusion therefore extends to the NK-annotated
+  cells: γδ cells cannot be identified among them either.
+* Consequently, **γδ abundance, phenotype or clinical associations should not be derived from this
+  dataset**, and TRDC-based annotations of it should be treated with caution.
+* The approach (calibration against TCR-validated cells + background test) is reusable to check the
+  feasibility of γδ analysis in any 3' dataset before interpreting it.
+* **Recommended next dataset**: Bassez et al. 2021 (Nat Med) — breast cancer, 10x 5' + TCR, ~30 patients
+  before/on anti-PD-1 with expansion status and receptor subtype; processed counts and TCR clonotypes are
+  available from the Lambrechts lab website.
+
+# Methods
+
+Scripts in `~/single_cell/Klughammer/gdT/`: `01_extract_TNK.py` (T/NK cells, raw counts, clinical table),
+`02_process_TNK.py` (normalisation, HVG, PCA, Harmony, UMAP, Leiden), `03_gd_calling.py` (expression
+rule and validation), `04a_export_for_decontx.py` / `04b_decontx.R` (conda env `decontx`) /
+`04c_background_test.py` (ambient-RNA correction and background test), `05_export_for_report.py`.
+Follow-up: `06_combined_rule_test.py` (positive-marker choice, combined constant-region rule, Azizi
+TCR truth), `07_cd3e_by_celltype.py` (CD3E vs other T transcripts in every cell type of the atlas),
+`08_nk_subclusters.py` (re-clustering of NK-annotated cells), `09_doublets.py` (Scrublet per channel,
+UMI-based doublet test and background test inside the T-like NK cells), `10_combined_score_call.py`
+(combined score used as a call in Azizi and Klughammer).
+Calibration data: `~/single_cell/Azizi/` (Azizi et al. 2018, GSE114727, 10x 5' + TCR).
+
+```{r session, echo=FALSE}
+cat(R.version.string, "\n")
+```

@@ -1,0 +1,25 @@
+# Main analysis environment. Versions are from the environment used for the analyses.
+anndata==0.12.13
+celltypist==1.7.1
+cytotrace2_py==1.1.0.4
+dcor==0.7
+drvi-py==0.2.5
+gseapy==1.2.1
+h5py==3.16.0
+harmonypy==2.0.0
+liana==1.8.0
+matplotlib==3.10.9
+mygene==3.2.2
+numpy==1.26.4
+pandas==2.3.3
+scanpy==1.11.5
+scikit-learn==1.8.0
+scipy==1.17.1
+scvi-tools==1.4.3
+seaborn==0.13.2
+statsmodels==0.14.6
+
+# Not installed in that environment, so no version is recorded:
+# diptest
+# scib-metrics (separate environment)
+# STCAT (separate environment)
